@@ -1,0 +1,7 @@
+build/
+lib/
+.vscode/
+rust/
+test/
+*.ll
+demangle/target/

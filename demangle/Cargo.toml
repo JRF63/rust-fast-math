@@ -1,0 +1,11 @@
+[package]
+name = "demangle"
+version = "0.1.0"
+authors = ["Joseph Rafael Ferrer <rafael2x0@gmail.com>"]
+edition = "2018"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rustc-demangle = "0.1"
