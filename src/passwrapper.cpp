@@ -25,17 +25,17 @@
 using namespace llvm;
 namespace passwrapper {
 
-const char *FastMathFuncList = "rust.fastmath.functions";
-const char *FastMathLabel = "rust.fastmath.flags";
+const char *UnsafeFPMathFunctionList = "rust.unsafe-fp-math.functions";
+const char *UnsafeFPMath = "rust.unsafe-fp-math.flags";
 
-void tagFastMath(Function *F, uint32_t Flags) {
+void tagUnsafeFPMath(Function *F, uint32_t Flags) {
   LLVMContext &C = F->getContext();
   auto *FlagsAsConstantInt = ConstantInt::get(Type::getInt32Ty(C), Flags);
   auto *FlagsAsMD = ConstantAsMetadata::get(FlagsAsConstantInt);
-  F->setMetadata(FastMathLabel, MDNode::get(C, {FlagsAsMD}));
+  F->setMetadata(UnsafeFPMath, MDNode::get(C, {FlagsAsMD}));
 }
 
-uint32_t readFastMath(Function *F, unsigned FastMathID) {
+uint32_t readUnsafeFPMathTag(Function *F, unsigned FastMathID) {
   uint32_t Flags = 0;
   if (Metadata *Node = F->getMetadata(FastMathID)) {
     Metadata *MD = cast<MDNode>(Node)->getOperand(0).get();
@@ -46,13 +46,13 @@ uint32_t readFastMath(Function *F, unsigned FastMathID) {
   return Flags;
 }
 
-FastMathFlags rustFastMathFlagsToFMF(uint32_t Flags) {
+FastMathFlags rustUnsafeFPMathFlagsToFMF(uint32_t Flags) {
   struct Pair {
     uint32_t Flag;
     void (FastMathFlags::*SetFlag)(bool);
   };
 
-  // Needs to match rustc_middle::middle::codegen_fn_attrs::FastMathFlags
+  // Needs to match rustc_middle::middle::codegen_fn_attrs::UnsafeFPMathFlags
   std::initializer_list<Pair> Pairs = {
       {1 << 0, &FastMathFlags::setAllowReassoc},
       {1 << 1, &FastMathFlags::setNoNaNs},
@@ -82,8 +82,8 @@ FastMathFlags rustFastMathFlagsToFMF(uint32_t Flags) {
 }
 
 void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
-  uint32_t Flags = readFastMath(P, FastMathID);
-  FastMathFlags FMF = rustFastMathFlagsToFMF(Flags);
+  uint32_t Flags = readUnsafeFPMathTag(P, FastMathID);
+  FastMathFlags FMF = rustUnsafeFPMathFlagsToFMF(Flags);
   SmallVector<Function *, 32> Stack = {P};
   SmallVector<char, 128> NameBuf;
 
@@ -97,7 +97,7 @@ void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
       return false;
     }
     // This function has already been visited.
-    if (readFastMath(F, FastMathID) == Flags) {
+    if (readUnsafeFPMathTag(F, FastMathID) == Flags) {
       return false;
     }
     return true;
@@ -121,7 +121,7 @@ void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
         CanDirectlyModify = true;
         for (User *U : F->users()) {
           if (auto *I = dyn_cast<Instruction>(U)) {
-            if (readFastMath(I->getFunction(), FastMathID) == Flags) {
+            if (readUnsafeFPMathTag(I->getFunction(), FastMathID) == Flags) {
               continue;
             }
           }
@@ -158,7 +158,7 @@ void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
     Stack.pop_back();
 
     // Mark the function as traversed with respect to the current Flags.
-    tagFastMath(F, Flags);
+    tagUnsafeFPMath(F, Flags);
 
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
@@ -197,22 +197,22 @@ void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
   }
 }
 
-extern "C" void LLVMRustTagFastMath(LLVMValueRef Fn, uint32_t Flags) {
+extern "C" void LLVMRustTagFunctionUnsafeFPMath(LLVMValueRef Fn, uint32_t Flags) {
   Function *F = unwrap<Function>(Fn);
-  tagFastMath(F, Flags);
+  tagUnsafeFPMath(F, Flags);
 
   Module *M = F->getParent();
   LLVMContext &C = M->getContext();
-  auto *List = M->getOrInsertNamedMetadata(FastMathFuncList);
+  auto *List = M->getOrInsertNamedMetadata(UnsafeFPMathFunctionList);
   auto *FuncName = MDString::get(C, F->getName());
   List->addOperand(MDNode::get(C, {FuncName}));
 }
 
-extern "C" void LLVMRustCheckAndApplyFastMath(LLVMModuleRef Mod) {
+extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
   Module *M = unwrap(Mod);
-  if (auto *List = M->getNamedMetadata(FastMathFuncList)) {
+  if (auto *List = M->getNamedMetadata(UnsafeFPMathFunctionList)) {
     // Querying with StringRef is relatively expensive so cache the metadata ID
-    unsigned FastMathID = M->getContext().getMDKindID(FastMathLabel);
+    unsigned FastMathID = M->getContext().getMDKindID(UnsafeFPMath);
 
     // Loop through all functions with the #[fp_math(...)] attribute
     for (auto *MDN : List->operands()) {

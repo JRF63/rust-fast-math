@@ -125,7 +125,7 @@ void tag_functions(std::unique_ptr<Module> &module,
   for (; name != func_names.end() || flag != flags.end(); ++name, ++flag) {
     Function *F = module->getFunction(*name);
     assert(F != nullptr);
-    passwrapper::LLVMRustTagFastMath(wrap(F), *flag);
+    passwrapper::LLVMRustTagFunctionUnsafeFPMath(wrap(F), *flag);
   }
 }
 

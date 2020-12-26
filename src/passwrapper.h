@@ -1,6 +1,6 @@
 #include "llvm/IR/Module.h"
 
 namespace passwrapper {
-extern "C" void LLVMRustTagFastMath(LLVMValueRef Fn, uint32_t Flags);
-extern "C" void LLVMRustCheckAndApplyFastMath(LLVMModuleRef Mod);
+extern "C" void LLVMRustTagFunctionUnsafeFPMath(LLVMValueRef Fn, uint32_t Flags);
+extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod);
 } // namespace passwrapper
