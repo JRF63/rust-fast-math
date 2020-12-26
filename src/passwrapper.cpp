@@ -19,56 +19,50 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 
-#include "llvm/Analysis/CallGraph.h"
+#include "llvm/IR/AbstractCallSite.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 namespace passwrapper {
 
-const char *FPMathFuncListLabel = "rust.fp-math.fns";
-const char *FPMathFlagsLabel = "rust.fp-math.flags";
+const char *FastMathFuncList = "rust.fastmath.functions";
+const char *FastMathLabel = "rust.fastmath.flags";
 
-void setFunctionFPMathFlags(Function *F, uint32_t Flags) {
+void tagFastMath(Function *F, uint32_t Flags) {
   LLVMContext &C = F->getContext();
-  auto FlagsAsConstantInt = ConstantInt::get(Type::getInt32Ty(C), Flags);
-  auto FlagsAsMD = ConstantAsMetadata::get(FlagsAsConstantInt);
-  F->setMetadata(FPMathFlagsLabel, MDNode::get(C, {FlagsAsMD}));
+  auto *FlagsAsConstantInt = ConstantInt::get(Type::getInt32Ty(C), Flags);
+  auto *FlagsAsMD = ConstantAsMetadata::get(FlagsAsConstantInt);
+  F->setMetadata(FastMathLabel, MDNode::get(C, {FlagsAsMD}));
 }
 
-extern "C" void LLVMRustTagFPMathFlags(LLVMValueRef Fn, uint32_t Flags) {
-  Function *F = unwrap<Function>(Fn);
-  setFunctionFPMathFlags(F, Flags);
-
-  Module *M = F->getParent();
-  LLVMContext &C = M->getContext();
-  auto List = M->getOrInsertNamedMetadata(FPMathFuncListLabel);
-  auto FuncName = MDString::get(C, F->getName());
-  List->addOperand(MDNode::get(C, {FuncName}));
-}
-
-uint32_t getFunctionFPMathFlags(Function *F, unsigned FPMathFlagsID) {
+uint32_t readFastMath(Function *F, unsigned FastMathID) {
   uint32_t Flags = 0;
-  if (Metadata *Node = F->getMetadata(FPMathFlagsID)) {
+  if (Metadata *Node = F->getMetadata(FastMathID)) {
     Metadata *MD = cast<MDNode>(Node)->getOperand(0).get();
-    auto FlagsAsConstant = cast<ConstantAsMetadata>(MD)->getValue();
-    auto FlagsAsConstantInt = cast<ConstantInt>(FlagsAsConstant);
+    auto *FlagsAsConstant = cast<ConstantAsMetadata>(MD)->getValue();
+    auto *FlagsAsConstantInt = cast<ConstantInt>(FlagsAsConstant);
     Flags = static_cast<uint32_t>(FlagsAsConstantInt->getZExtValue());
   }
   return Flags;
 }
 
-FastMathFlags rustFPMathFlagsToFMF(uint32_t Flags) {
-  // Needs to match rustc_middle::middle::codegen_fn_attrs::FPMathFlags
-  enum RustFPMathFlags : uint32_t {
-    AllowReassoc = 1 << 0,
-    NoNaNs = 1 << 1,
-    NoInfs = 1 << 2,
-    NoSignedZeros = 1 << 3,
-    AllowReciprocal = 1 << 4,
-    AllowContract = 1 << 5,
-    ApproxFunc = 1 << 6
+FastMathFlags rustFastMathFlagsToFMF(uint32_t Flags) {
+  struct Pair {
+    uint32_t Flag;
+    void (FastMathFlags::*SetFlag)(bool);
   };
-  // Result of OR'ing all the flags
+
+  // Needs to match rustc_middle::middle::codegen_fn_attrs::FastMathFlags
+  std::initializer_list<Pair> Pairs = {
+      {1 << 0, &FastMathFlags::setAllowReassoc},
+      {1 << 1, &FastMathFlags::setNoNaNs},
+      {1 << 2, &FastMathFlags::setNoInfs},
+      {1 << 3, &FastMathFlags::setNoSignedZeros},
+      {1 << 4, &FastMathFlags::setAllowReciprocal},
+      {1 << 5, &FastMathFlags::setAllowContract},
+      {1 << 6, &FastMathFlags::setApproxFunc}};
+
+  // Result of setting all the flags
   uint32_t Fast = (1 << 7) - 1;
 
   FastMathFlags FMF;
@@ -78,97 +72,124 @@ FastMathFlags rustFPMathFlagsToFMF(uint32_t Flags) {
     return FMF;
   }
 
-  if (Flags & AllowReassoc) {
-    FMF.setAllowReassoc(true);
+  for (auto P : Pairs) {
+    if (Flags & P.Flag) {
+      (FMF.*(P.SetFlag))(true);
+    }
   }
-  if (Flags & NoNaNs) {
-    FMF.setNoNaNs(true);
-  }
-  if (Flags & NoInfs) {
-    FMF.setNoInfs(true);
-  }
-  if (Flags & NoSignedZeros) {
-    FMF.setNoSignedZeros(true);
-  }
-  if (Flags & AllowReciprocal) {
-    FMF.setAllowReciprocal(true);
-  }
-  if (Flags & AllowContract) {
-    FMF.setAllowContract(true);
-  }
-  if (Flags & ApproxFunc) {
-    FMF.setApproxFunc(true);
-  }
+
   return FMF;
 }
 
-void directlySetFMF(Function *F, FastMathFlags FMF) {
-  for (BasicBlock &BB : F->getBasicBlockList()) {
-    for (Instruction &I : BB.getInstList()) {
-      if (isa<FPMathOperator>(I)) {
-        I.copyFastMathFlags(FMF);
+void recursivelyApplyFastMath(Module *M, Function *P, unsigned FastMathID) {
+  uint32_t Flags = readFastMath(P, FastMathID);
+  FastMathFlags FMF = rustFastMathFlagsToFMF(Flags);
+  SmallVector<Function *, 32> Stack = {P};
+  SmallVector<char, 128> NameBuf;
+
+  auto isValidTarget = [=](Function *F) -> bool {
+    if (F == nullptr) {
+      return false;
+    }
+    // We can't access the definitions of intrinsics or externally
+    // defined functions.
+    if (F->isIntrinsic() || F->isDeclaration()) {
+      return false;
+    }
+    // This function has already been visited.
+    if (readFastMath(F, FastMathID) == Flags) {
+      return false;
+    }
+    return true;
+  };
+
+  auto nextTarget = [=, &NameBuf](Function *F) -> Function * {
+    bool CanDirectlyModify = false;
+    if (F == P) {
+      // Functions marked with the attribute _should_ be modified directly.
+      CanDirectlyModify = true;
+    } else {
+      GlobalValue::LinkageTypes L = F->getLinkage();
+      if (L == GlobalValue::LinkageTypes::InternalLinkage ||
+          L == GlobalValue::LinkageTypes::PrivateLinkage) {
+        // If all the users' functions have the same flag then this can be
+        // modified directly.
+        //
+        // This is a purposely simple heuristic. Completely determining whether
+        // the function can avoid being cloned requires SCC traversal of the
+        // call graph and can be more expensive than just cloning.
+        CanDirectlyModify = true;
+        for (User *U : F->users()) {
+          if (auto *I = dyn_cast<Instruction>(U)) {
+            if (readFastMath(I->getFunction(), FastMathID) == Flags) {
+              continue;
+            }
+          }
+          CanDirectlyModify = false;
+          break;
+        }
       }
     }
-  }
-}
 
-Function *cloneFunctionUsingName(Function *F, std::string &Name) {
-  ValueToValueMapTy VMap;
-  Function *Clone = CloneFunction(F, VMap);
-  Clone->setName(Name);
-  return Clone;
-}
+    if (CanDirectlyModify) {
+      return F;
+    } else {
+      // oldname.fm{flags as hex}
+      StringRef NewName =
+          (F->getName() + ".fm" + Twine::utohexstr(Flags)).toStringRef(NameBuf);
 
-void recursivelyApplyFPMathFlags(CallGraph &CG, CallGraphNode *CGN,
-                                 uint32_t Flags, unsigned FPMathFlagsID) {
-  FastMathFlags FMF = rustFPMathFlagsToFMF(Flags);
-  std::vector<CallGraphNode *> Stack = {CGN};
+      // Get the previously cloned function or create a new one
+      Function *Clone = M->getFunction(NewName);
+      if (Clone == nullptr) {
+        ValueToValueMapTy VMap;
+        Clone = CloneFunction(F, VMap);
+        Clone->setName(NewName);
+        Clone->setLinkage(GlobalValue::LinkageTypes::InternalLinkage);
+      }
+      // Must manually clear to avoid concatenating the names.
+      NameBuf.clear();
+
+      return Clone;
+    }
+  };
 
   while (!Stack.empty()) {
-    CallGraphNode *Node = Stack.back();
+    Function *F = Stack.back();
     Stack.pop_back();
 
-    for (auto CR = Node->begin(); CR != Node->end(); ++CR) {
-      // If has an actual call edge
-      if (CR->first) {
-        CallGraphNode *ChildNode = CR->second;
-        if (Function *ChildFn = ChildNode->getFunction()) {
-          uint32_t ChildFlags = getFunctionFPMathFlags(ChildFn, FPMathFlagsID);
-          GlobalValue::LinkageTypes L = ChildFn->getLinkage();
-          // Funcs with more than 1 callers or that are exported must be cloned
-          bool MustClone = !(ChildNode->getNumReferences() == 1 &&
-                             (L == GlobalValue::LinkageTypes::InternalLinkage ||
-                              L == GlobalValue::LinkageTypes::PrivateLinkage));
+    // Mark the function as traversed with respect to the current Flags.
+    tagFastMath(F, Flags);
 
-          // If flags are diff. and the function is defined in the module.
-          if (ChildFlags != Flags && !(ChildFn->isDeclaration())) {
-            if (MustClone) {
-              std::string NewName = ChildFn->getName().str();
-              NewName.append(".fm");
-              NewName.append(std::to_string(Flags));
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        if (isa<FPMathOperator>(I)) {
+          I.copyFastMathFlags(FMF);
+        }
 
-              // Get the previously cloned function or create a new one
-              Function *Clone = CG.getModule().getFunction(NewName);
-              if (Clone == nullptr) {
-                Clone = cloneFunctionUsingName(ChildFn, NewName);
-                Clone->setLinkage(GlobalValue::LinkageTypes::InternalLinkage);
-                CG.addToCallGraph(Clone);
-                directlySetFMF(Clone, FMF);
-                setFunctionFPMathFlags(Clone, Flags);
-              }
-
-              // Make the parent function call the clone instead
-              WeakTrackingVH I = CR->first.getValue();
-              auto Call = cast<CallBase>(I);
-              Call->setCalledFunction(Clone);
-
-              Stack.push_back(CG[Clone]);
-
-            } else {
-              directlySetFMF(ChildFn, FMF);
-              setFunctionFPMathFlags(ChildFn, Flags);
-              Stack.push_back(ChildNode);
+        if (auto *Call = dyn_cast<CallBase>(&I)) {
+          Function *Callee = Call->getCalledFunction();
+          if (isValidTarget(Callee)) {
+            Function *CalleeOrClone = nextTarget(Callee);
+            // If cloned..
+            if (Callee != CalleeOrClone) {
+              // Make the parent function call the Clone instead.
+              Call->setCalledFunction(CalleeOrClone);
             }
+            Stack.push_back(CalleeOrClone);
+
+            // Rust doesn't emit the `callback` metadata so this does not do
+            // anything yet.
+            forEachCallbackCallSite(*Call, [=, &Stack](AbstractCallSite &ACS) {
+              Function *Callback = ACS.getCalledFunction();
+              if (isValidTarget(Callback)) {
+                Function *CallbackOrClone = nextTarget(Callback);
+                if (Callback != CallbackOrClone) {
+                  ACS.getInstruction()->setOperand(
+                      ACS.getCallArgOperandNoForCallee(), CallbackOrClone);
+                }
+                Stack.push_back(CallbackOrClone);
+              }
+            });
           }
         }
       }
@@ -176,25 +197,28 @@ void recursivelyApplyFPMathFlags(CallGraph &CG, CallGraphNode *CGN,
   }
 }
 
-extern "C" void LLVMRustCheckAndApplyFPMathFlags(LLVMModuleRef Mod) {
+extern "C" void LLVMRustTagFastMath(LLVMValueRef Fn, uint32_t Flags) {
+  Function *F = unwrap<Function>(Fn);
+  tagFastMath(F, Flags);
+
+  Module *M = F->getParent();
+  LLVMContext &C = M->getContext();
+  auto *List = M->getOrInsertNamedMetadata(FastMathFuncList);
+  auto *FuncName = MDString::get(C, F->getName());
+  List->addOperand(MDNode::get(C, {FuncName}));
+}
+
+extern "C" void LLVMRustCheckAndApplyFastMath(LLVMModuleRef Mod) {
   Module *M = unwrap(Mod);
-
-  if (auto List = M->getNamedMetadata(FPMathFuncListLabel)) {
-    LLVMContext &C = M->getContext();
+  if (auto *List = M->getNamedMetadata(FastMathFuncList)) {
     // Querying with StringRef is relatively expensive so cache the metadata ID
-    unsigned FPMathFlagsID = C.getMDKindID(FPMathFlagsLabel);
+    unsigned FastMathID = M->getContext().getMDKindID(FastMathLabel);
 
-    CallGraph CG(*M);
     // Loop through all functions with the #[fp_math(...)] attribute
-    for (auto Node : List->operands()) {
-      Metadata *MD = Node->getOperand(0).get();
-      auto FuncName = cast<MDString>(MD);
+    for (auto *MDN : List->operands()) {
+      auto *FuncName = cast<MDString>(MDN->getOperand(0).get());
       Function *F = M->getFunction(FuncName->getString());
-      uint32_t Flags = getFunctionFPMathFlags(F, FPMathFlagsID);
-      directlySetFMF(F, rustFPMathFlagsToFMF(Flags));
-
-      // Modify the callees
-      recursivelyApplyFPMathFlags(CG, CG[F], Flags, FPMathFlagsID);
+      recursivelyApplyFastMath(M, F, FastMathID);
     }
   }
 }

@@ -6,8 +6,9 @@ use std::io::{self, Write};
 type c_char = i8;
 type size_t = usize;
 
+// Copied over from compiler::rustc_llvm for demangling func names
 #[no_mangle]
-pub extern "C" fn demangle_callback(
+pub extern "C" fn demangle(
     input_ptr: *const c_char,
     input_len: size_t,
     output_ptr: *mut c_char,
