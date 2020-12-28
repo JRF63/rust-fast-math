@@ -5,7 +5,7 @@
 #include <system_error>
 #include <vector>
 
-#include "passwrapper.h"
+#include "rustwrapper.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/AssemblyAnnotationWriter.h"
 #include "llvm/IR/Instructions.h"
