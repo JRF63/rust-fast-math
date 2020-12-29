@@ -149,19 +149,7 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
 
             // Inspect the direct callees of this function.
             if (auto *Call = dyn_cast<CallBase>(&I)) {
-              // The intrinsics that can have the fast-math flags return floats
-              // or float vectors. We're assuming here that the Rust wrappers
-              // of such intrinsics also have the same signature.
-              // Duplicated from `llvm/IR/Operator.h` because we're also
-              // considering `invoke` and not just `call`.
-              Type *Ty = Call->getType();
-              while (ArrayType *ArrTy = dyn_cast<ArrayType>(Ty)) {
-                Ty = ArrTy->getElementType();
-              }
-              if (!Ty->isFPOrFPVectorTy()) {
-                continue;
-              }
-
+              
               Function *Callee = Call->getCalledFunction();
 
               // Not considering indirect calls

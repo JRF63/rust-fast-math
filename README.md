@@ -1,0 +1,1 @@
+Prototype fast-math function attribute for Rust.
