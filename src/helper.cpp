@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <system_error>
 #include <vector>
 
@@ -88,17 +89,24 @@ public:
 
 namespace helper {
 
-std::string read_module_file(char *filename) {
-  std::ifstream ifs(filename);
-  std::string content((std::istreambuf_iterator<char>(ifs)),
+std::string read_stream(std::istream &istream) {
+  std::string content((std::istreambuf_iterator<char>(istream)),
                       (std::istreambuf_iterator<char>()));
   return content;
 }
 
-std::unique_ptr<Module> create_module(char *filename, SMDiagnostic &error,
+std::string read_module_file(char *filename) {
+  std::ifstream ifs(filename);
+  return read_stream(ifs);
+}
+
+std::string read_stdin() {
+  return read_stream(std::cin);
+}
+
+std::unique_ptr<Module> create_module(StringRef asmstring, SMDiagnostic &error,
                                       LLVMContext &context) {
-  std::string file = read_module_file(filename);
-  auto module = parseAssemblyString(file, error, context);
+  auto module = parseAssemblyString(asmstring, error, context);
   assert(module != nullptr);
   return module;
 }

@@ -4,8 +4,9 @@
 
 namespace helper {
 std::string read_module_file(char *filename);
+std::string read_stdin();
 
-std::unique_ptr<llvm::Module> create_module(char *filename,
+std::unique_ptr<llvm::Module> create_module(llvm::StringRef asmstring,
                                             llvm::SMDiagnostic &error,
                                             llvm::LLVMContext &context);
 

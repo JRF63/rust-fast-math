@@ -93,13 +93,15 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
   Module *M = unwrap(Mod);
 
   if (auto *List = M->getNamedMetadata(UnsafeFPMathFunctionList)) {
+    SmallVector<Function *, 8> Stack;
+    SmallVector<char, 128> NameBuf;
+    SmallPtrSet<Function *, 8> Visited;
+    ValueToValueMapTy VMap;
+
     // Querying with StringRef is relatively expensive so cache the metadata ID
     unsigned UnsafeFPMathID = M->getContext().getMDKindID(UnsafeFPMathTag);
 
-    SmallVector<char, 128> NameBuf;
-    ValueToValueMapTy VMap;
-
-    auto stdFPMethodOrVectorIntrinsic = Regex(
+    auto FPMethodOrVectorIntrinsic = Regex(
         // [legacy]
         // std::f32::<impl f32>::
         // std::f64::<impl f64>::
@@ -128,22 +130,37 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
       uint32_t Flags = readUnsafeFPMathTag(F, UnsafeFPMathID);
       FastMathFlags FMF = rustUnsafeFPMathFlagsToFMF(Flags);
 
-      for (BasicBlock &BB : *F) {
-        for (Instruction &I : BB) {
-          // Check the instructions that can have fast-math flags: `fneg`,
-          // `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fcmp`, `phi`, `select` and
-          // also `call`'s return a floating-point scalar or vector type
-          if (isa<FPMathOperator>(I)) {
-            // Set the flags on the attributed function. This also sets the
-            // flags on direct calls to LLVM intrinsics.
-            I.copyFastMathFlags(FMF);
+      Stack.clear();
+      Stack.push_back(F);
+      Visited.clear();
+      Visited.insert(F);
 
-            // Inspect the direct callees of this function. The intrinsics that
-            // can have the fast-math flags return floats or float vectors.
-            // We're assuming here that the Rust wrappers of such intrinsics
-            // have the same signature hence this is also under the
-            // `isa<FPMathOperator>(I)` check.
+      // Do a depth-first search on the function's callees
+      while (!Stack.empty()) {
+        for (BasicBlock &BB : *Stack.pop_back_val()) {
+          for (Instruction &I : BB) {
+            // Check the instructions that can have fast-math flags: `fneg`,
+            // `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fcmp`, `phi`, `select`
+            // and also `call`'s return a floating-point scalar or vector type
+            if (isa<FPMathOperator>(I)) {
+              // Set the flags on the function
+              I.copyFastMathFlags(FMF);
+            }
+
+            // Inspect the direct callees of this function.
             if (auto *Call = dyn_cast<CallBase>(&I)) {
+              // The intrinsics that can have the fast-math flags return floats
+              // or float vectors. We're assuming here that the Rust wrappers
+              // of such intrinsics also have the same signature.
+              // Duplicated from `llvm/IR/Operator.h` because we're also
+              // considering `invoke` and not just `call`.
+              Type *Ty = Call->getType();
+              while (ArrayType *ArrTy = dyn_cast<ArrayType>(Ty)) {
+                Ty = ArrTy->getElementType();
+              }
+              if (!Ty->isFPOrFPVectorTy()) {
+                continue;
+              }
 
               Function *Callee = Call->getCalledFunction();
 
@@ -158,9 +175,16 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
               }
               // Only considering floating-point functions in `std` and
               // intrinsics in `core::arch`
-              if (!stdFPMethodOrVectorIntrinsic.match(Callee->getName())) {
+              if (!FPMethodOrVectorIntrinsic.match(Callee->getName())) {
                 continue;
               }
+              // Pessimistically guards against recursive functions but there
+              // shouldn't be any for float methods or intrinsics in `std` or
+              // `core`
+              if (Visited.contains(Callee)) {
+                continue;
+              }
+              Visited.insert(Callee);
 
               bool MustClone = true;
 
@@ -172,8 +196,9 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
                 MustClone = false;
                 for (User *U : Callee->users()) {
                   if (auto *I = dyn_cast<Instruction>(U)) {
-                    if (readUnsafeFPMathTag(I->getFunction(), UnsafeFPMathID) !=
-                        Flags) {
+                    uint32_t UserFlags =
+                        readUnsafeFPMathTag(I->getFunction(), UnsafeFPMathID);
+                    if (UserFlags != Flags) {
                       MustClone = true;
                       break;
                     }
@@ -181,12 +206,8 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
                 }
               }
 
-              if (Callee->getName().startswith("_ZN3std3f6421_$LT$impl$u20$f64$GT$2ln")) {
-                printf("Here\n");
-              }
-
               if (MustClone) {
-                // Clear to avoid concatenating the names
+                // Would concatenate the names if not cleared
                 NameBuf.clear();
                 // Append `.fm{flags as hex}` to the original name
                 StringRef NewName =
@@ -207,14 +228,9 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
                 Callee = Clone;
               }
 
-              // Set the flags on the callee/clone
-              for (BasicBlock &BBCallee : *Callee) {
-                for (Instruction &ICallee : BBCallee) {
-                  if (isa<FPMathOperator>(ICallee)) {
-                    ICallee.copyFastMathFlags(FMF);
-                  }
-                }
-              }
+              // At this point, Callee is either a clone or can be modified
+              // directly so it can be safely added to the DFS stack
+              Stack.push_back(Callee);
             }
           }
         }
