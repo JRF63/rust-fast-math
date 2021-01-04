@@ -17,7 +17,7 @@ endif()
 if(NOT DEFINED LLVM_PATH)
     message(FATAL_ERROR "Must specify LLVM path:\ncmake -G <generator> -DLLVM_PATH={path}")
 endif()
-set(LLVM_LIBS LLVMAnalysis LLVMAsmParser LLVMBinaryFormat LLVMBitstreamReader LLVMCore LLVMIRReader LLVMRemarks LLVMSupport LLVMTransformUtils)
+set(LLVM_LIBS LLVMAnalysis LLVMAsmParser LLVMBinaryFormat LLVMBitstreamReader LLVMCore LLVMIRReader LLVMProfileData LLVMRemarks LLVMSupport LLVMTransformUtils)
 
 project(LLVMCloning)
 

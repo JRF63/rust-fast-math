@@ -93,11 +93,6 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
   Module *M = unwrap(Mod);
 
   if (auto *List = M->getNamedMetadata(UnsafeFPMathFunctionList)) {
-    SmallVector<Function *, 8> Stack;
-    SmallVector<char, 128> NameBuf;
-    SmallPtrSet<Function *, 8> Visited;
-    ValueToValueMapTy VMap;
-
     // Querying with StringRef is relatively expensive so cache the metadata ID
     unsigned UnsafeFPMathID = M->getContext().getMDKindID(UnsafeFPMathTag);
 
@@ -122,104 +117,56 @@ extern "C" void LLVMRustCheckAndApplyUnsafeFPMath(LLVMModuleRef Mod) {
         "(MNtCs(kKxLsFYgSDi_3std|59sSsiVHtSQ_4core)3(f32|f64))|"
         "(NtNtNtCs59sSsiVHtSQ_4core9core_arch)))");
 
+    SmallVector<CallBase *, 8> Calls;
+    InlineFunctionInfo IFI;
+
     // Loop through all functions with the #[unsafe_fp_math(...)] attribute
     for (auto *MDN : List->operands()) {
       auto *MD = cast<ValueAsMetadata>(MDN->getOperand(0).get());
       auto *F = cast<Function>(MD->getValue());
 
+      // Add all calls of this function
+      Calls.clear();
+      for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+          if (auto *Call = dyn_cast<CallBase>(&I)) {
+            Calls.push_back(Call);
+          }
+        }
+      }
+
+      // Attempt to "flatten" the LLVM instrinsic calls into the body of this
+      // function
+      while (!Calls.empty()) {
+        CallBase *Call = Calls.pop_back_val();
+        Function *Callee = Call->getCalledFunction();
+
+        // Skip indirect calls
+        if (Callee == nullptr) {
+          continue;
+        }
+        // Only considering floating-point functions in `std` and
+        // intrinsics in `core::arch`
+        if (!FPMethodOrVectorIntrinsic.match(Callee->getName())) {
+          continue;
+        }
+
+        // Inline the current call and add its calls for processing
+        IFI.reset();
+        if (InlineFunction(*Call, IFI).isSuccess()) {
+          for (CallBase *SubCall : IFI.InlinedCallSites) {
+            Calls.push_back(SubCall);
+          }
+        }
+      }
+
+      // Set the fast-math flags on all applicable instructions
       uint32_t Flags = readUnsafeFPMathTag(F, UnsafeFPMathID);
       FastMathFlags FMF = rustUnsafeFPMathFlagsToFMF(Flags);
-
-      Stack.clear();
-      Stack.push_back(F);
-      Visited.clear();
-      Visited.insert(F);
-
-      // Do a depth-first search on the function's callees
-      while (!Stack.empty()) {
-        for (BasicBlock &BB : *Stack.pop_back_val()) {
-          for (Instruction &I : BB) {
-            // Check the instructions that can have fast-math flags: `fneg`,
-            // `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fcmp`, `phi`, `select`
-            // and also `call`'s return a floating-point scalar or vector type
-            if (isa<FPMathOperator>(I)) {
-              // Set the flags on the function
-              I.copyFastMathFlags(FMF);
-            }
-
-            // Inspect the direct callees of this function.
-            if (auto *Call = dyn_cast<CallBase>(&I)) {
-              
-              Function *Callee = Call->getCalledFunction();
-
-              // Not considering indirect calls
-              if (Callee == nullptr) {
-                continue;
-              }
-              // We can't access the definitions of intrinsics or externally
-              // defined functions so skip them
-              if (Callee->isIntrinsic() || Callee->isDeclaration()) {
-                continue;
-              }
-              // Only considering floating-point functions in `std` and
-              // intrinsics in `core::arch`
-              if (!FPMethodOrVectorIntrinsic.match(Callee->getName())) {
-                continue;
-              }
-              // Pessimistically guards against recursive functions but there
-              // shouldn't be any for float methods or intrinsics in `std` or
-              // `core`
-              if (Visited.contains(Callee)) {
-                continue;
-              }
-              Visited.insert(Callee);
-
-              bool MustClone = true;
-
-              GlobalValue::LinkageTypes L = Callee->getLinkage();
-              if (L == GlobalValue::LinkageTypes::InternalLinkage ||
-                  L == GlobalValue::LinkageTypes::PrivateLinkage) {
-                // If all the users of this function have the same flag then
-                // this can be modified directly
-                MustClone = false;
-                for (User *U : Callee->users()) {
-                  if (auto *I = dyn_cast<Instruction>(U)) {
-                    uint32_t UserFlags =
-                        readUnsafeFPMathTag(I->getFunction(), UnsafeFPMathID);
-                    if (UserFlags != Flags) {
-                      MustClone = true;
-                      break;
-                    }
-                  }
-                }
-              }
-
-              if (MustClone) {
-                // Would concatenate the names if not cleared
-                NameBuf.clear();
-                // Append `.fm{flags as hex}` to the original name
-                StringRef NewName =
-                    (Callee->getName() + ".fm" + Twine::utohexstr(Flags))
-                        .toStringRef(NameBuf);
-
-                // Get the previously cloned function or create a new one
-                Function *Clone = M->getFunction(NewName);
-                if (Clone == nullptr) {
-                  // Must clear the reused VMap for the next cloning
-                  VMap.clear();
-                  Clone = CloneFunction(Callee, VMap);
-                  Clone->setName(NewName);
-                }
-
-                // Make the parent function call the Clone instead
-                Call->setCalledFunction(Clone);
-                Callee = Clone;
-              }
-
-              // At this point, Callee is either a clone or can be modified
-              // directly so it can be safely added to the DFS stack
-              Stack.push_back(Callee);
-            }
+      for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+          if (isa<FPMathOperator>(I)) {
+            I.copyFastMathFlags(FMF);
           }
         }
       }
